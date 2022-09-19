@@ -3,13 +3,18 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/actions-runner-controller/actions-runner-controller/testing"
+	"github.com/google/go-github/v47/github"
 	"github.com/onsi/gomega"
+	"golang.org/x/oauth2"
 	"sigs.k8s.io/yaml"
 )
 
@@ -21,6 +26,8 @@ const (
 )
 
 var (
+	// See the below link for maintained versions of cert-manager
+	// https://cert-manager.io/docs/installation/supported-releases/
 	certManagerVersion = "v1.8.2"
 
 	images = []testing.ContainerImage{
@@ -32,6 +39,8 @@ var (
 	}
 
 	testResultCMNamePrefix = "test-result-"
+
+	RunnerVersion = "2.296.0"
 )
 
 // If you're willing to run this test via VS Code "run test" or "debug test",
@@ -43,7 +52,8 @@ var (
 // But messages logged via Logf shows up only when the test failed by default.
 // To always enable logging, do not forget to pass `-test.v` to `go test`.
 // If you're using VS Code, open `Workspace Settings` and search for `go test flags`, edit the `.vscode/settings.json` and put the below:
-//   "go.testFlags": ["-v"]
+//
+//	"go.testFlags": ["-v"]
 //
 // This function requires a few environment variables to be set to provide some test data.
 // If you're using VS Code and wanting to run this test locally,
@@ -57,12 +67,16 @@ var (
 // https://terratest.gruntwork.io/docs/testing-best-practices/iterating-locally-using-test-stages/
 //
 // This functions leaves PVs undeleted. To delete PVs, run:
-//   kubectl get pv -ojson | jq -rMc '.items[] | select(.status.phase == "Available") | {name:.metadata.name, status:.status.phase} | .name' | xargs kubectl delete pv
+//
+//	kubectl get pv -ojson | jq -rMc '.items[] | select(.status.phase == "Available") | {name:.metadata.name, status:.status.phase} | .name' | xargs kubectl delete pv
 //
 // If you disk full after dozens of test runs, try:
-//   docker system prune
+//
+//	docker system prune
+//
 // and
-//   kind delete cluster --name teste2e
+//
+//	kind delete cluster --name teste2e
 //
 // The former tend to release 200MB-3GB and the latter can result in releasing like 100GB due to kind node contains loaded container images and
 // (in case you use it) local provisioners disk image(which is implemented as a directory within the kind node).
@@ -79,6 +93,29 @@ func TestE2E(t *testing.T) {
 
 	vars := buildVars(os.Getenv("ARC_E2E_IMAGE_REPO"))
 
+	var testedVersions = []struct {
+		label                     string
+		controller, controllerVer string
+		chart, chartVer           string
+	}{
+		{
+			label:         "stable",
+			controller:    "summerwind/actions-runner-controller",
+			controllerVer: "v0.25.2",
+			chart:         "actions-runner-controller/actions-runner-controller",
+			// 0.20.2 accidentally added support for runner-status-update which isn't supported by ARC 0.25.2.
+			// With some chart values, the controller end up with crashlooping with `flag provided but not defined: -runner-status-update-hook`.
+			chartVer: "0.20.1",
+		},
+		{
+			label:         "edge",
+			controller:    vars.controllerImageRepo,
+			controllerVer: vars.controllerImageTag,
+			chart:         "",
+			chartVer:      "",
+		},
+	}
+
 	env := initTestEnv(t, k8sMinorVer, vars)
 	if vt := os.Getenv("ARC_E2E_VERIFY_TIMEOUT"); vt != "" {
 		var err error
@@ -87,6 +124,7 @@ func TestE2E(t *testing.T) {
 			t.Fatalf("Failed to parse duration %q: %v", vt, err)
 		}
 	}
+	env.doDockerBuild = os.Getenv("ARC_E2E_DO_DOCKER_BUILD") != ""
 
 	t.Run("build and load images", func(t *testing.T) {
 		env.buildAndLoadImages(t)
@@ -123,9 +161,9 @@ func TestE2E(t *testing.T) {
 			})
 		}
 
-		t.Run("install actions-runner-controller v0.24.1", func(t *testing.T) {
-			env.installActionsRunnerController(t, "summerwind/actions-runner-controller", "v0.24.1", testID)
-		})
+		if t.Failed() {
+			return
+		}
 
 		t.Run("install argo-tunnel", func(t *testing.T) {
 			env.installArgoTunnel(t)
@@ -137,22 +175,37 @@ func TestE2E(t *testing.T) {
 			})
 		}
 
-		t.Run("deploy runners", func(t *testing.T) {
-			env.deploy(t, RunnerSets, testID)
-		})
-
-		if !skipRunnerCleanUp {
-			t.Cleanup(func() {
-				env.undeploy(t, RunnerSets, testID)
-			})
-		}
-
-		t.Run("install edge actions-runner-controller", func(t *testing.T) {
-			env.installActionsRunnerController(t, vars.controllerImageRepo, vars.controllerImageTag, testID)
-		})
-
 		if t.Failed() {
 			return
+		}
+
+		for i, v := range testedVersions {
+			t.Run("install actions-runner-controller "+v.label, func(t *testing.T) {
+				t.Logf("Using controller %s:%s and chart %s:%s", v.controller, v.controllerVer, v.chart, v.chartVer)
+				env.installActionsRunnerController(t, v.controller, v.controllerVer, testID, v.chart, v.chartVer)
+			})
+
+			if t.Failed() {
+				return
+			}
+
+			if i > 0 {
+				continue
+			}
+
+			t.Run("deploy runners", func(t *testing.T) {
+				env.deploy(t, RunnerSets, testID)
+			})
+
+			if !skipRunnerCleanUp {
+				t.Cleanup(func() {
+					env.undeploy(t, RunnerSets, testID)
+				})
+			}
+
+			if t.Failed() {
+				return
+			}
 		}
 
 		t.Run("Install workflow", func(t *testing.T) {
@@ -163,12 +216,37 @@ func TestE2E(t *testing.T) {
 			return
 		}
 
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			for i := 1; ; i++ {
+				select {
+				case _, ok := <-ctx.Done():
+					if !ok {
+						t.Logf("Stopping the continuous rolling-update of runners")
+					}
+				default:
+					time.Sleep(60 * time.Second)
+
+					t.Run(fmt.Sprintf("update runners attempt %d", i), func(t *testing.T) {
+						env.deploy(t, RunnerSets, testID, fmt.Sprintf("ROLLING_UPDATE_PHASE=%d", i))
+					})
+				}
+			}
+		}()
+		t.Cleanup(func() {
+			cancel()
+		})
+
 		t.Run("Verify workflow run result", func(t *testing.T) {
 			env.verifyActionsWorkflowRun(t, testID)
 		})
 	})
 
 	t.Run("RunnerDeployments", func(t *testing.T) {
+		if os.Getenv("ARC_E2E_SKIP_RUNNERDEPLOYMENT") != "" {
+			t.Skip("RunnerSets test has been skipped due to ARC_E2E_SKIP_RUNNERSETS")
+		}
+
 		var (
 			testID string
 		)
@@ -183,9 +261,9 @@ func TestE2E(t *testing.T) {
 			})
 		}
 
-		t.Run("install actions-runner-controller v0.24.1", func(t *testing.T) {
-			env.installActionsRunnerController(t, "summerwind/actions-runner-controller", "v0.24.1", testID)
-		})
+		if t.Failed() {
+			return
+		}
 
 		t.Run("install argo-tunnel", func(t *testing.T) {
 			env.installArgoTunnel(t)
@@ -197,22 +275,37 @@ func TestE2E(t *testing.T) {
 			})
 		}
 
-		t.Run("deploy runners", func(t *testing.T) {
-			env.deploy(t, RunnerDeployments, testID)
-		})
-
-		if !skipRunnerCleanUp {
-			t.Cleanup(func() {
-				env.undeploy(t, RunnerDeployments, testID)
-			})
-		}
-
-		t.Run("install edge actions-runner-controller", func(t *testing.T) {
-			env.installActionsRunnerController(t, vars.controllerImageRepo, vars.controllerImageTag, testID)
-		})
-
 		if t.Failed() {
 			return
+		}
+
+		for i, v := range testedVersions {
+			t.Run("install actions-runner-controller "+v.label, func(t *testing.T) {
+				t.Logf("Using controller %s:%s and chart %s:%s", v.controller, v.controllerVer, v.chart, v.chartVer)
+				env.installActionsRunnerController(t, v.controller, v.controllerVer, testID, v.chart, v.chartVer)
+			})
+
+			if t.Failed() {
+				return
+			}
+
+			if i > 0 {
+				continue
+			}
+
+			t.Run("deploy runners", func(t *testing.T) {
+				env.deploy(t, RunnerDeployments, testID)
+			})
+
+			if !skipRunnerCleanUp {
+				t.Cleanup(func() {
+					env.undeploy(t, RunnerDeployments, testID)
+				})
+			}
+
+			if t.Failed() {
+				return
+			}
 		}
 
 		t.Run("Install workflow", func(t *testing.T) {
@@ -222,6 +315,27 @@ func TestE2E(t *testing.T) {
 		if t.Failed() {
 			return
 		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			for i := 1; ; i++ {
+				select {
+				case _, ok := <-ctx.Done():
+					if !ok {
+						t.Logf("Stopping the continuous rolling-update of runners")
+					}
+				default:
+					time.Sleep(10 * time.Second)
+
+					t.Run(fmt.Sprintf("update runners - attempt %d", i), func(t *testing.T) {
+						env.deploy(t, RunnerDeployments, testID, fmt.Sprintf("ROLLING_UPDATE_PHASE=%d", i))
+					})
+				}
+			}
+		}()
+		t.Cleanup(func() {
+			cancel()
+		})
 
 		t.Run("Verify workflow run result", func(t *testing.T) {
 			env.verifyActionsWorkflowRun(t, testID)
@@ -252,6 +366,11 @@ type env struct {
 	scaleDownDelaySecondsAfterScaleOut          int64
 	minReplicas                                 int64
 	dockerdWithinRunnerContainer                bool
+	rootlessDocker                              bool
+	doDockerBuild                               bool
+	containerMode                               string
+	runnerServiceAccuontName                    string
+	runnerNamespace                             string
 	remoteKubeconfig                            string
 	imagePullSecretName                         string
 	imagePullPolicy                             string
@@ -263,8 +382,9 @@ type env struct {
 type vars struct {
 	controllerImageRepo, controllerImageTag string
 
-	runnerImageRepo     string
-	runnerDindImageRepo string
+	runnerImageRepo             string
+	runnerDindImageRepo         string
+	runnerRootlessDindImageRepo string
 
 	prebuildImages []testing.ContainerImage
 	builds         []testing.DockerBuild
@@ -278,20 +398,23 @@ func buildVars(repo string) vars {
 	}
 
 	var (
-		controllerImageRepo = repo + "/actions-runner-controller"
-		controllerImageTag  = "e2e"
-		controllerImage     = testing.Img(controllerImageRepo, controllerImageTag)
-		runnerImageRepo     = repo + "/actions-runner"
-		runnerDindImageRepo = repo + "/actions-runner-dind"
-		runnerImageTag      = "e2e"
-		runnerImage         = testing.Img(runnerImageRepo, runnerImageTag)
-		runnerDindImage     = testing.Img(runnerDindImageRepo, runnerImageTag)
+		controllerImageRepo         = repo + "/actions-runner-controller"
+		controllerImageTag          = "e2e"
+		controllerImage             = testing.Img(controllerImageRepo, controllerImageTag)
+		runnerImageRepo             = repo + "/actions-runner"
+		runnerDindImageRepo         = repo + "/actions-runner-dind"
+		runnerRootlessDindImageRepo = repo + "/actions-runner-rootless-dind"
+		runnerImageTag              = "e2e"
+		runnerImage                 = testing.Img(runnerImageRepo, runnerImageTag)
+		runnerDindImage             = testing.Img(runnerDindImageRepo, runnerImageTag)
+		runnerRootlessDindImage     = testing.Img(runnerRootlessDindImageRepo, runnerImageTag)
 	)
 
 	var vs vars
 
 	vs.controllerImageRepo, vs.controllerImageTag = controllerImageRepo, controllerImageTag
 	vs.runnerDindImageRepo = runnerDindImageRepo
+	vs.runnerRootlessDindImageRepo = runnerRootlessDindImageRepo
 	vs.runnerImageRepo = runnerImageRepo
 
 	// vs.controllerImage, vs.controllerImageTag
@@ -300,6 +423,7 @@ func buildVars(repo string) vars {
 		controllerImage,
 		runnerImage,
 		runnerDindImage,
+		runnerRootlessDindImage,
 	}
 
 	vs.builds = []testing.DockerBuild{
@@ -314,7 +438,7 @@ func buildVars(repo string) vars {
 			Args: []testing.BuildArg{
 				{
 					Name:  "RUNNER_VERSION",
-					Value: "2.294.0",
+					Value: RunnerVersion,
 				},
 			},
 			Image:        runnerImage,
@@ -325,10 +449,21 @@ func buildVars(repo string) vars {
 			Args: []testing.BuildArg{
 				{
 					Name:  "RUNNER_VERSION",
-					Value: "2.294.0",
+					Value: RunnerVersion,
 				},
 			},
 			Image:        runnerDindImage,
+			EnableBuildX: true,
+		},
+		{
+			Dockerfile: "../../runner/actions-runner-dind-rootless.dockerfile",
+			Args: []testing.BuildArg{
+				{
+					Name:  "RUNNER_VERSION",
+					Value: RunnerVersion,
+				},
+			},
+			Image:        runnerRootlessDindImage,
 			EnableBuildX: true,
 		},
 	}
@@ -364,6 +499,8 @@ func initTestEnv(t *testing.T, k8sMinorVer string, vars vars) *env {
 	e.testOrgRepo = testing.Getenv(t, "TEST_ORG_REPO", "")
 	e.testEnterprise = testing.Getenv(t, "TEST_ENTERPRISE", "")
 	e.testEphemeral = testing.Getenv(t, "TEST_EPHEMERAL", "")
+	e.runnerServiceAccuontName = testing.Getenv(t, "TEST_RUNNER_SERVICE_ACCOUNT_NAME", "")
+	e.runnerNamespace = testing.Getenv(t, "TEST_RUNNER_NAMESPACE", "default")
 	e.remoteKubeconfig = testing.Getenv(t, "ARC_E2E_REMOTE_KUBECONFIG", "")
 	e.imagePullSecretName = testing.Getenv(t, "ARC_E2E_IMAGE_PULL_SECRET_NAME", "")
 	e.vars = vars
@@ -397,7 +534,86 @@ func initTestEnv(t *testing.T, k8sMinorVer string, vars vars) *env {
 		panic(fmt.Sprintf("unable to parse bool from TEST_RUNNER_DOCKERD_WITHIN_RUNNER_CONTAINER: %v", err))
 	}
 
+	e.rootlessDocker, err = strconv.ParseBool(testing.Getenv(t, "TEST_RUNNER_ROOTLESS_DOCKER", "false"))
+	if err != nil {
+		panic(fmt.Sprintf("unable to parse bool from TEST_RUNNER_ROOTLESS_DOCKER: %v", err))
+	}
+
+	e.containerMode = testing.Getenv(t, "TEST_CONTAINER_MODE", "")
+	if err != nil {
+		panic(fmt.Sprintf("unable to parse bool from TEST_CONTAINER_MODE: %v", err))
+	}
+
+	if err := e.checkGitHubToken(t, e.githubToken); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.checkGitHubToken(t, e.githubTokenWebhook); err != nil {
+		t.Fatal(err)
+	}
+
 	return e
+}
+
+func (e *env) checkGitHubToken(t *testing.T, tok string) error {
+	t.Helper()
+
+	ctx := context.Background()
+
+	transport := oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok})).Transport
+	c := github.NewClient(&http.Client{Transport: transport})
+	aa, res, err := c.Octocat(context.Background(), "hello")
+	if err != nil {
+		b, ioerr := io.ReadAll(res.Body)
+		if ioerr != nil {
+			t.Logf("%v", ioerr)
+			return err
+		}
+		t.Logf(string(b))
+		return err
+	}
+
+	t.Logf("%s", aa)
+
+	if e.testEnterprise != "" {
+		if _, res, err := c.Enterprise.CreateRegistrationToken(ctx, e.testEnterprise); err != nil {
+			b, ioerr := io.ReadAll(res.Body)
+			if ioerr != nil {
+				t.Logf("%v", ioerr)
+				return err
+			}
+			t.Logf(string(b))
+			return err
+		}
+	}
+
+	if e.testOrg != "" {
+		if _, res, err := c.Actions.CreateOrganizationRegistrationToken(ctx, e.testOrg); err != nil {
+			b, ioerr := io.ReadAll(res.Body)
+			if ioerr != nil {
+				t.Logf("%v", ioerr)
+				return err
+			}
+			t.Logf(string(b))
+			return err
+		}
+	}
+
+	if e.testRepo != "" {
+		s := strings.Split(e.testRepo, "/")
+		owner, repo := s[0], s[1]
+		if _, res, err := c.Actions.CreateRegistrationToken(ctx, owner, repo); err != nil {
+			b, ioerr := io.ReadAll(res.Body)
+			if ioerr != nil {
+				t.Logf("%v", ioerr)
+				return err
+			}
+			t.Logf(string(b))
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (e *env) f() {
@@ -448,7 +664,7 @@ func (e *env) installCertManager(t *testing.T) {
 	e.KubectlWaitUntilDeployAvailable(t, "cert-manager", waitCfg.WithTimeout(60*time.Second))
 }
 
-func (e *env) installActionsRunnerController(t *testing.T, repo, tag, testID string) {
+func (e *env) installActionsRunnerController(t *testing.T, repo, tag, testID, chart, chartVer string) {
 	t.Helper()
 
 	e.createControllerNamespaceAndServiceAccount(t)
@@ -456,6 +672,8 @@ func (e *env) installActionsRunnerController(t *testing.T, repo, tag, testID str
 	scriptEnv := []string{
 		"KUBECONFIG=" + e.Kubeconfig,
 		"ACCEPTANCE_TEST_DEPLOYMENT_TOOL=" + "helm",
+		"CHART=" + chart,
+		"CHART_VERSION=" + chartVer,
 	}
 
 	varEnv := []string{
@@ -487,9 +705,9 @@ func (e *env) installActionsRunnerController(t *testing.T, repo, tag, testID str
 	e.RunScript(t, "../../acceptance/deploy.sh", testing.ScriptConfig{Dir: "../..", Env: scriptEnv})
 }
 
-func (e *env) deploy(t *testing.T, kind DeployKind, testID string) {
+func (e *env) deploy(t *testing.T, kind DeployKind, testID string, env ...string) {
 	t.Helper()
-	e.do(t, "apply", kind, testID)
+	e.do(t, "apply", kind, testID, env...)
 }
 
 func (e *env) undeploy(t *testing.T, kind DeployKind, testID string) {
@@ -497,7 +715,7 @@ func (e *env) undeploy(t *testing.T, kind DeployKind, testID string) {
 	e.do(t, "delete", kind, testID)
 }
 
-func (e *env) do(t *testing.T, op string, kind DeployKind, testID string) {
+func (e *env) do(t *testing.T, op string, kind DeployKind, testID string, env ...string) {
 	t.Helper()
 
 	e.createControllerNamespaceAndServiceAccount(t)
@@ -505,7 +723,10 @@ func (e *env) do(t *testing.T, op string, kind DeployKind, testID string) {
 	scriptEnv := []string{
 		"KUBECONFIG=" + e.Kubeconfig,
 		"OP=" + op,
+		"RUNNER_NAMESPACE=" + e.runnerNamespace,
+		"RUNNER_SERVICE_ACCOUNT_NAME=" + e.runnerServiceAccuontName,
 	}
+	scriptEnv = append(scriptEnv, env...)
 
 	switch kind {
 	case RunnerSets:
@@ -527,13 +748,27 @@ func (e *env) do(t *testing.T, op string, kind DeployKind, testID string) {
 		fmt.Sprintf("REPO_RUNNER_MIN_REPLICAS=%d", e.minReplicas),
 		fmt.Sprintf("ORG_RUNNER_MIN_REPLICAS=%d", e.minReplicas),
 		fmt.Sprintf("ENTERPRISE_RUNNER_MIN_REPLICAS=%d", e.minReplicas),
+		"RUNNER_CONTAINER_MODE=" + e.containerMode,
+	}
+
+	if e.dockerdWithinRunnerContainer && e.containerMode == "kubernetes" {
+		t.Fatalf("TEST_RUNNER_DOCKERD_WITHIN_RUNNER_CONTAINER cannot be set along with TEST_CONTAINER_MODE=kubernetes")
+		t.FailNow()
 	}
 
 	if e.dockerdWithinRunnerContainer {
 		varEnv = append(varEnv,
 			"RUNNER_DOCKERD_WITHIN_RUNNER_CONTAINER=true",
-			"RUNNER_NAME="+e.vars.runnerDindImageRepo,
 		)
+		if e.rootlessDocker {
+			varEnv = append(varEnv,
+				"RUNNER_NAME="+e.vars.runnerRootlessDindImageRepo,
+			)
+		} else {
+			varEnv = append(varEnv,
+				"RUNNER_NAME="+e.vars.runnerDindImageRepo,
+			)
+		}
 	} else {
 		varEnv = append(varEnv,
 			"RUNNER_DOCKERD_WITHIN_RUNNER_CONTAINER=false",
@@ -583,7 +818,7 @@ func (e *env) createControllerNamespaceAndServiceAccount(t *testing.T) {
 func (e *env) installActionsWorkflow(t *testing.T, kind DeployKind, testID string) {
 	t.Helper()
 
-	installActionsWorkflow(t, e.testName+" "+testID, e.runnerLabel(testID), testResultCMNamePrefix, e.repoToCommit, kind, e.testJobs(testID))
+	installActionsWorkflow(t, e.testName+" "+testID, e.runnerLabel(testID), testResultCMNamePrefix, e.repoToCommit, kind, e.testJobs(testID), !e.rootlessDocker, e.doDockerBuild)
 }
 
 func (e *env) testJobs(testID string) []job {
@@ -624,7 +859,8 @@ func createTestJobs(id, testResultCMNamePrefix string, numJobs int) []job {
 
 const Branch = "main"
 
-func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNamePrefix, testRepo string, kind DeployKind, testJobs []job) {
+// useSudo also implies rootful docker and the use of buildx cache export/import
+func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNamePrefix, testRepo string, kind DeployKind, testJobs []job, useSudo, doDockerBuild bool) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -655,26 +891,54 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 			},
 		}
 
+		var sudo string
+		if useSudo {
+			sudo = "sudo "
+		}
+
 		if !kubernetesContainerMode {
 			if kind == RunnerDeployments {
 				steps = append(steps,
 					testing.Step{
-						Run: "sudo mkdir -p \"${RUNNER_TOOL_CACHE}\" \"${HOME}/.cache\" \"/var/lib/docker\"",
+						Run: sudo + "mkdir -p \"${RUNNER_TOOL_CACHE}\" \"${HOME}/.cache\"",
+					},
+				)
+
+				if useSudo {
+					steps = append(steps,
+						testing.Step{
+							// This might be the easiest way to handle permissions without use of securityContext
+							// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
+							Run: sudo + "mkdir -p \"/var/lib/docker\"",
+						},
+					)
+				}
+			}
+
+			if useSudo {
+				steps = append(steps,
+					testing.Step{
+						// This might be the easiest way to handle permissions without use of securityContext
+						// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
+						Run: sudo + "chmod 777 -R \"${RUNNER_TOOL_CACHE}\" \"${HOME}/.cache\"",
+					},
+					testing.Step{
+						Run: sudo + "chmod 777 -R \"/var/lib/docker\"",
+					},
+					testing.Step{
+						// This might be the easiest way to handle permissions without use of securityContext
+						// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
+						Run: "ls -lah \"${RUNNER_TOOL_CACHE}\" \"${HOME}/.cache\"",
+					},
+					testing.Step{
+						// This might be the easiest way to handle permissions without use of securityContext
+						// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
+						Run: "ls -lah \"/var/lib/docker\" || echo ls failed.",
 					},
 				)
 			}
 
 			steps = append(steps,
-				testing.Step{
-					// This might be the easiest way to handle permissions without use of securityContext
-					// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
-					Run: "sudo chmod 777 -R \"${RUNNER_TOOL_CACHE}\" \"${HOME}/.cache\" \"/var/lib/docker\"",
-				},
-				testing.Step{
-					// This might be the easiest way to handle permissions without use of securityContext
-					// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
-					Run: "ls -lah \"${RUNNER_TOOL_CACHE}\" \"${HOME}/.cache\" \"/var/lib/docker\"",
-				},
 				testing.Step{
 					Uses: "actions/setup-go@v3",
 					With: &testing.With{
@@ -693,34 +957,54 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 			},
 		)
 
-		if !kubernetesContainerMode {
-			steps = append(steps,
-				testing.Step{
-					// https://github.com/docker/buildx/issues/413#issuecomment-710660155
-					// To prevent setup-buildx-action from failing with:
-					//   error: could not create a builder instance with TLS data loaded from environment. Please use `docker context create <context-name>` to create a context for current environment and then create a builder instance with `docker buildx create <context-name>`
-					Run: "docker context create mycontext",
-				},
-				testing.Step{
-					Run: "docker context use mycontext",
-				},
-				testing.Step{
-					Name: "Set up Docker Buildx",
-					Uses: "docker/setup-buildx-action@v1",
-					With: &testing.With{
-						BuildkitdFlags: "--debug",
-						Endpoint:       "mycontext",
-						// As the consequence of setting `install: false`, it doesn't install buildx as an alias to `docker build`
-						// so we need to use `docker buildx build` in the next step
-						Install: false,
+		if doDockerBuild {
+			if !kubernetesContainerMode {
+				setupBuildXActionWith := &testing.With{
+					BuildkitdFlags: "--debug",
+					Endpoint:       "mycontext",
+					// As the consequence of setting `install: false`, it doesn't install buildx as an alias to `docker build`
+					// so we need to use `docker buildx build` in the next step
+					Install: false,
+				}
+				var dockerBuildCache, dockerfile string
+				if useSudo {
+					// This needs to be set only when rootful docker mode.
+					// When rootless, we need to use the `docker` buildx driver, which doesn't support cache export
+					// so we end up with the below error on docker-build:
+					//   error: cache export feature is currently not supported for docker driver. Please switch to a different driver (eg. "docker buildx create --use")
+					dockerBuildCache = "--cache-from=type=local,src=/home/runner/.cache/buildx " +
+						"--cache-to=type=local,dest=/home/runner/.cache/buildx-new,mode=max "
+					dockerfile = "Dockerfile"
+				} else {
+					setupBuildXActionWith.Driver = "docker"
+					dockerfile = "Dockerfile.nocache"
+				}
+				steps = append(steps,
+					testing.Step{
+						// https://github.com/docker/buildx/issues/413#issuecomment-710660155
+						// To prevent setup-buildx-action from failing with:
+						//   error: could not create a builder instance with TLS data loaded from environment. Please use `docker context create <context-name>` to create a context for current environment and then create a builder instance with `docker buildx create <context-name>`
+						Run: "docker context create mycontext",
 					},
-				},
-				testing.Step{
-					Run: "docker buildx build --platform=linux/amd64 " +
-						"--cache-from=type=local,src=/home/runner/.cache/buildx " +
-						"--cache-to=type=local,dest=/home/runner/.cache/buildx-new,mode=max " +
-						".",
-				},
+					testing.Step{
+						Run: "docker context use mycontext",
+					},
+					testing.Step{
+						Name: "Set up Docker Buildx",
+						Uses: "docker/setup-buildx-action@v1",
+						With: setupBuildXActionWith,
+					},
+					testing.Step{
+						Run: "docker buildx build --platform=linux/amd64 " +
+							dockerBuildCache +
+							fmt.Sprintf("-f %s .", dockerfile),
+					},
+				)
+			}
+		}
+
+		if useSudo {
+			steps = append(steps,
 				testing.Step{
 					// https://github.com/docker/build-push-action/blob/master/docs/advanced/cache.md#local-cache
 					// See https://github.com/moby/buildkit/issues/1896 for why this is needed
@@ -729,17 +1013,20 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 				testing.Step{
 					Run: "ls -lah /home/runner/.cache/*",
 				},
-				testing.Step{
-					Uses: "azure/setup-kubectl@v1",
-					With: &testing.With{
-						Version: "v1.20.2",
-					},
-				},
-				testing.Step{
-					Run: fmt.Sprintf("./test.sh %s %s", t.Name(), j.testArg),
-				},
 			)
 		}
+
+		steps = append(steps,
+			testing.Step{
+				Uses: "azure/setup-kubectl@v1",
+				With: &testing.With{
+					Version: "v1.20.2",
+				},
+			},
+			testing.Step{
+				Run: fmt.Sprintf("./test.sh %s %s", t.Name(), j.testArg),
+			},
+		)
 
 		wf.Jobs[j.name] = testing.Job{
 			RunsOn:    runnerLabel,

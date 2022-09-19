@@ -10,11 +10,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/actions-runner-controller/actions-runner-controller/build"
 	"github.com/actions-runner-controller/actions-runner-controller/github/metrics"
 	"github.com/actions-runner-controller/actions-runner-controller/logging"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/go-logr/logr"
-	"github.com/google/go-github/v45/github"
+	"github.com/google/go-github/v47/github"
 	"github.com/gregjones/httpcache"
 	"golang.org/x/oauth2"
 )
@@ -42,6 +43,7 @@ type Client struct {
 	mu        sync.Mutex
 	// GithubBaseURL to Github without API suffix.
 	GithubBaseURL string
+	IsEnterprise  bool
 }
 
 type BasicAuthTransport struct {
@@ -94,8 +96,10 @@ func (c *Config) NewClient() (*Client, error) {
 
 	var client *github.Client
 	var githubBaseURL string
+	var isEnterprise bool
 	if len(c.EnterpriseURL) > 0 {
 		var err error
+		isEnterprise = true
 		client, err = github.NewEnterpriseClient(c.EnterpriseURL, c.EnterpriseURL, httpClient)
 		if err != nil {
 			return nil, fmt.Errorf("enterprise client creation failed: %v", err)
@@ -134,14 +138,13 @@ func (c *Config) NewClient() (*Client, error) {
 			}
 		}
 	}
-
-	client.UserAgent = "actions-runner-controller"
-
+	client.UserAgent = "actions-runner-controller/" + build.Version
 	return &Client{
 		Client:        client,
 		regTokens:     map[string]*github.RegistrationToken{},
 		mu:            sync.Mutex{},
 		GithubBaseURL: githubBaseURL,
+		IsEnterprise:  isEnterprise,
 	}, nil
 }
 
@@ -241,29 +244,6 @@ func (c *Client) ListRunners(ctx context.Context, enterprise, org, repo string) 
 	}
 
 	return runners, nil
-}
-
-// ListOrganizationRunnerGroups returns all the runner groups defined in the organization and
-// inherited to the organization from an enterprise.
-func (c *Client) ListOrganizationRunnerGroups(ctx context.Context, org string) ([]*github.RunnerGroup, error) {
-	var runnerGroups []*github.RunnerGroup
-
-	opts := github.ListOrgRunnerGroupOptions{}
-	opts.PerPage = 100
-	for {
-		list, res, err := c.Client.Actions.ListOrganizationRunnerGroups(ctx, org, &opts)
-		if err != nil {
-			return runnerGroups, fmt.Errorf("failed to list organization runner groups: %w", err)
-		}
-
-		runnerGroups = append(runnerGroups, list.RunnerGroups...)
-		if res.NextPage == 0 {
-			break
-		}
-		opts.Page = res.NextPage
-	}
-
-	return runnerGroups, nil
 }
 
 // ListOrganizationRunnerGroupsForRepository returns all the runner groups defined in the organization and
@@ -439,7 +419,6 @@ func splitOwnerAndRepo(repo string) (string, string, error) {
 	}
 	return chunk[0], chunk[1], nil
 }
-
 func getEnterpriseApiUrl(baseURL string) (string, error) {
 	baseEndpoint, err := url.Parse(baseURL)
 	if err != nil {

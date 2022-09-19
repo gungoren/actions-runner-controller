@@ -24,6 +24,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/actions-runner-controller/actions-runner-controller/api/v1alpha1"
+	"github.com/actions-runner-controller/actions-runner-controller/build"
 	"github.com/actions-runner-controller/actions-runner-controller/controllers"
 	"github.com/actions-runner-controller/actions-runner-controller/github"
 	"github.com/actions-runner-controller/actions-runner-controller/logging"
@@ -62,7 +63,6 @@ func (i *stringSlice) Set(value string) error {
 	*i = append(*i, value)
 	return nil
 }
-
 func main() {
 	var (
 		err      error
@@ -87,7 +87,6 @@ func main() {
 
 		commonRunnerLabels commaSeparatedStringSlice
 	)
-
 	var c github.Config
 	err = envconfig.Process("github", &c)
 	if err != nil {
@@ -104,6 +103,7 @@ func main() {
 	flag.Var(&runnerImagePullSecrets, "runner-image-pull-secret", "The default image-pull secret name for self-hosted runner container.")
 	flag.StringVar(&dockerRegistryMirror, "docker-registry-mirror", "", "The default Docker Registry Mirror used by runners.")
 	flag.StringVar(&c.Token, "github-token", c.Token, "The personal access token of GitHub.")
+	flag.StringVar(&c.EnterpriseURL, "github-enterprise-url", c.EnterpriseURL, "Enterprise URL to be used for your GitHub API calls")
 	flag.Int64Var(&c.AppID, "github-app-id", c.AppID, "The application ID of GitHub App.")
 	flag.Int64Var(&c.AppInstallationID, "github-app-installation-id", c.AppInstallationID, "The installation ID of GitHub App.")
 	flag.StringVar(&c.AppPrivateKey, "github-app-private-key", c.AppPrivateKey, "The path of a private key file to authenticate as a GitHub App")
@@ -122,7 +122,6 @@ func main() {
 	flag.Parse()
 
 	logger := logging.NewLogger(logLevel)
-
 	c.Log = &logger
 
 	ghClient, err = c.NewClient()
@@ -214,6 +213,7 @@ func main() {
 
 	log.Info(
 		"Initializing actions-runner-controller",
+		"version", build.Version,
 		"default-scale-down-delay", defaultScaleDownDelay,
 		"sync-period", syncPeriod,
 		"default-runner-image", runnerImage,
